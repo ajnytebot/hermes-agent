@@ -8,6 +8,14 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 source venv/bin/activate  # ALWAYS activate before running Python
 ```
 
+## Repo Truth and Runtime Governance
+
+- Repo history is the source of truth. A live deploy lane is not allowed to remain the long-term truth surface.
+- If the running gateway depends on code from a sandbox or deploy lane, that behavior must be promoted into a reviewable repo branch/worktree and verified there before closure.
+- Do not treat `.venv/`, `.pytest_cache/`, `.hermes/`, `CURRENT.md`, or local scratch handoff files as canonical source artifacts.
+- If runtime truth and repo truth diverge badly, use the bounded reset procedure documented in `docs/specs/repo-truth-and-runtime-governance.md`.
+- Do not call runtime-affecting work landed or canonical until the promoted state exists as an actual commit.
+
 ## Project Structure
 
 ```
