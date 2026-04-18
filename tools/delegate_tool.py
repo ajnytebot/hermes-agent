@@ -20,9 +20,14 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
+
+from hermes_cli.codex_lane import CodexLaneError, run_codex_lane_turn
+from toolsets import TOOLSETS
 
 
 # Tools that children must never have access to
@@ -34,10 +39,50 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
     "execute_code",    # children should reason step-by-step, not write scripts
 ])
 
-MAX_CONCURRENT_CHILDREN = 3
+# Build a description fragment listing toolsets available for subagents.
+# Excludes toolsets where ALL tools are blocked, composite/platform toolsets
+# (hermes-* prefixed), and scenario toolsets.
+_EXCLUDED_TOOLSET_NAMES = frozenset({"debugging", "safe", "delegation", "moa", "rl"})
+_SUBAGENT_TOOLSETS = sorted(
+    name for name, defn in TOOLSETS.items()
+    if name not in _EXCLUDED_TOOLSET_NAMES
+    and not name.startswith("hermes-")
+    and not all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
+)
+_TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
+
+_DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+
+
+def _get_max_concurrent_children() -> int:
+    """Read delegation.max_concurrent_children from config, falling back to
+    DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
+
+    Uses the same ``_load_config()`` path that the rest of ``delegate_task``
+    uses, keeping config priority consistent (config.yaml > env > default).
+    """
+    cfg = _load_config()
+    val = cfg.get("max_concurrent_children")
+    if val is not None:
+        try:
+            return max(1, int(val))
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.max_concurrent_children=%r is not a valid integer; "
+                "using default %d", val, _DEFAULT_MAX_CONCURRENT_CHILDREN,
+            )
+    env_val = os.getenv("DELEGATION_MAX_CONCURRENT_CHILDREN")
+    if env_val:
+        try:
+            return max(1, int(env_val))
+        except (TypeError, ValueError):
+            pass
+    return _DEFAULT_MAX_CONCURRENT_CHILDREN
 DEFAULT_MAX_ITERATIONS = 50
+_HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+VALID_EXECUTION_BACKENDS = frozenset(["default", "codex_sdk_lane"])
 
 
 def check_delegate_requirements() -> bool:
@@ -45,7 +90,12 @@ def check_delegate_requirements() -> bool:
     return True
 
 
-def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
+def _build_child_system_prompt(
+    goal: str,
+    context: Optional[str] = None,
+    *,
+    workspace_path: Optional[str] = None,
+) -> str:
     """Build a focused system prompt for a child agent."""
     parts = [
         "You are a focused subagent working on a specific delegated task.",
@@ -54,6 +104,12 @@ def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+    if workspace_path and str(workspace_path).strip():
+        parts.append(
+            "\nWORKSPACE PATH:\n"
+            f"{workspace_path}\n"
+            "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+        )
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -61,10 +117,131 @@ def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
         "- What you found or accomplished\n"
         "- Any files you created or modified\n"
         "- Any issues encountered\n\n"
+        "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
+        "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
     return "\n".join(parts)
+
+
+def _resolve_workspace_hint(parent_agent) -> Optional[str]:
+    """Best-effort local workspace hint for child prompts.
+
+    We only inject a path when we have a concrete absolute directory. This avoids
+    teaching subagents a fake container path while still helping them avoid
+    guessing `/workspace/...` for local repo tasks.
+    """
+    candidates = [
+        os.getenv("TERMINAL_CWD"),
+        getattr(getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None),
+        getattr(parent_agent, "terminal_cwd", None),
+        getattr(parent_agent, "cwd", None),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            text = os.path.abspath(os.path.expanduser(str(candidate)))
+        except Exception:
+            continue
+        if os.path.isabs(text) and os.path.isdir(text):
+            return text
+    return None
+
+
+def _resolve_execution_backend(task: Dict[str, Any], default_backend: str) -> str:
+    backend = str(task.get("execution_backend") or default_backend or "default").strip() or "default"
+    if backend not in VALID_EXECUTION_BACKENDS:
+        raise ValueError(
+            f"Unsupported execution_backend '{backend}'. Use one of: {', '.join(sorted(VALID_EXECUTION_BACKENDS))}."
+        )
+    return backend
+
+
+def _build_codex_lane_name(parent_agent, task_index: int) -> str:
+    session_seed = (
+        getattr(parent_agent, "session_id", None)
+        or getattr(parent_agent, "task_id", None)
+        or "delegate"
+    )
+    safe_seed = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(session_seed))
+    return f"delegate-{safe_seed}-{task_index + 1}"
+
+
+def _run_codex_lane_child(
+    *,
+    task_index: int,
+    task: Dict[str, Any],
+    parent_agent,
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    goal = task.get("goal", "")
+    context = task.get("context")
+    workspace_path = _resolve_workspace_hint(parent_agent)
+    if not workspace_path or not os.path.isabs(workspace_path):
+        return {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": "codex_sdk_lane requires an absolute repo root / working directory.",
+            "api_calls": 0,
+            "duration_seconds": round(time.monotonic() - started, 2),
+        }
+
+    prompt_parts = [goal.strip()]
+    if context and str(context).strip():
+        prompt_parts.extend(["", "Context:", str(context).strip()])
+    prompt = "\n".join(prompt_parts).strip()
+
+    try:
+        result = run_codex_lane_turn(
+            repo_root=workspace_path,
+            lane_name=_build_codex_lane_name(parent_agent, task_index),
+            working_directory=workspace_path,
+            prompt=prompt,
+            resume=True,
+            session_id=getattr(parent_agent, "session_id", None),
+            parent_session_id=getattr(parent_agent, "parent_session_id", None),
+            session_db=getattr(parent_agent, "_session_db", None),
+        )
+        duration = round(time.monotonic() - started, 2)
+        status = "completed" if result.final_response else result.status
+        entry: Dict[str, Any] = {
+            "task_index": task_index,
+            "status": status,
+            "summary": result.final_response or None,
+            "api_calls": 1,
+            "duration_seconds": duration,
+            "model": None,
+            "exit_reason": result.status,
+            "tokens": result.usage or {},
+            "tool_trace": result.commands,
+            "execution_backend": "codex_sdk_lane",
+            "codex_lane": {
+                "lane_name": result.lane_name,
+                "thread_id": result.thread_id,
+                "artifacts": result.artifacts,
+                "changed_files": result.changed_files,
+                "failed_items": result.failed_items,
+                "item_types": result.item_types,
+            },
+        }
+        if result.status not in {"completed", "failed"}:
+            entry["status"] = result.status
+        if not result.final_response and result.status != "completed":
+            entry["error"] = result.raw.get("error", "Codex lane did not produce a final response.")
+        return entry
+    except CodexLaneError as exc:
+        return {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": str(exc),
+            "api_calls": 0,
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "execution_backend": "codex_sdk_lane",
+        }
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
@@ -210,7 +387,8 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
-    child_prompt = _build_child_system_prompt(goal, context)
+    workspace_hint = _resolve_workspace_hint(parent_agent)
+    child_prompt = _build_child_system_prompt(goal, context, workspace_path=workspace_hint)
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -245,6 +423,25 @@ def _build_child_agent(
     effective_acp_command = override_acp_command or getattr(parent_agent, "acp_command", None)
     effective_acp_args = list(override_acp_args if override_acp_args is not None else (getattr(parent_agent, "acp_args", []) or []))
 
+    # Resolve reasoning config: delegation override > parent inherit
+    parent_reasoning = getattr(parent_agent, "reasoning_config", None)
+    child_reasoning = parent_reasoning
+    try:
+        delegation_cfg = _load_config()
+        delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
+        if delegation_effort:
+            from hermes_constants import parse_reasoning_effort
+            parsed = parse_reasoning_effort(delegation_effort)
+            if parsed is not None:
+                child_reasoning = parsed
+            else:
+                logger.warning(
+                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                    delegation_effort,
+                )
+    except Exception as exc:
+        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -255,7 +452,7 @@ def _build_child_agent(
         acp_args=effective_acp_args,
         max_iterations=max_iterations,
         max_tokens=getattr(parent_agent, "max_tokens", None),
-        reasoning_config=getattr(parent_agent, "reasoning_config", None),
+        reasoning_config=child_reasoning,
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         enabled_toolsets=child_toolsets,
         quiet_mode=True,
@@ -278,6 +475,12 @@ def _build_child_agent(
     child._print_fn = getattr(parent_agent, '_print_fn', None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
+
+    # Share a credential pool with the child when possible so subagents can
+    # rotate credentials on rate limits instead of getting pinned to one key.
+    child_pool = _resolve_child_credential_pool(effective_provider, parent_agent)
+    if child_pool is not None:
+        child._credential_pool = child_pool
 
     # Register child for interrupt propagation
     if hasattr(parent_agent, '_active_children'):
@@ -311,6 +514,56 @@ def _run_single_child(
     import model_tools
     _saved_tool_names = getattr(child, "_delegate_saved_tool_names",
                                 list(model_tools._last_resolved_tool_names))
+
+    child_pool = getattr(child, '_credential_pool', None)
+    leased_cred_id = None
+    if child_pool is not None:
+        leased_cred_id = child_pool.acquire_lease()
+        if leased_cred_id is not None:
+            try:
+                leased_entry = child_pool.current()
+                if leased_entry is not None and hasattr(child, '_swap_credential'):
+                    child._swap_credential(leased_entry)
+            except Exception as exc:
+                logger.debug("Failed to bind child to leased credential: %s", exc)
+
+    # Heartbeat: periodically propagate child activity to the parent so the
+    # gateway inactivity timeout doesn't fire while the subagent is working.
+    # Without this, the parent's _last_activity_ts freezes when delegate_task
+    # starts and the gateway eventually kills the agent for "no activity".
+    _heartbeat_stop = threading.Event()
+
+    def _heartbeat_loop():
+        while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+            if parent_agent is None:
+                continue
+            touch = getattr(parent_agent, '_touch_activity', None)
+            if not touch:
+                continue
+            # Pull detail from the child's own activity tracker
+            desc = f"delegate_task: subagent {task_index} working"
+            try:
+                child_summary = child.get_activity_summary()
+                child_tool = child_summary.get("current_tool")
+                child_iter = child_summary.get("api_call_count", 0)
+                child_max = child_summary.get("max_iterations", 0)
+                if child_tool:
+                    desc = (f"delegate_task: subagent running {child_tool} "
+                            f"(iteration {child_iter}/{child_max})")
+                else:
+                    child_desc = child_summary.get("last_activity_desc", "")
+                    if child_desc:
+                        desc = (f"delegate_task: subagent {child_desc} "
+                                f"(iteration {child_iter}/{child_max})")
+            except Exception:
+                pass
+            try:
+                touch(desc)
+            except Exception:
+                pass
+
+    _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    _heartbeat_thread.start()
 
     try:
         result = child.run_conversation(user_message=goal)
@@ -422,6 +675,17 @@ def _run_single_child(
         }
 
     finally:
+        # Stop the heartbeat thread so it doesn't keep touching parent activity
+        # after the child has finished (or failed).
+        _heartbeat_stop.set()
+        _heartbeat_thread.join(timeout=5)
+
+        if child_pool is not None and leased_cred_id is not None:
+            try:
+                child_pool.release_lease(leased_cred_id)
+            except Exception as exc:
+                logger.debug("Failed to release credential lease: %s", exc)
+
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -429,6 +693,8 @@ def _run_single_child(
         saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
         if isinstance(saved_tool_names, list):
             model_tools._last_resolved_tool_names = list(saved_tool_names)
+
+        # Remove child from active tracking
 
         # Unregister child from interrupt propagation
         if hasattr(parent_agent, '_active_children'):
@@ -442,6 +708,15 @@ def _run_single_child(
             except (ValueError, UnboundLocalError) as e:
                 logger.debug("Could not remove child from active_children: %s", e)
 
+        # Close tool resources (terminal sandboxes, browser daemons,
+        # background processes, httpx clients) so subagent subprocesses
+        # don't outlive the delegation.
+        try:
+            if hasattr(child, 'close'):
+                child.close()
+        except Exception:
+            logger.debug("Failed to close child agent after delegation")
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -450,6 +725,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
+    execution_backend: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -462,7 +738,7 @@ def delegate_task(
     Returns JSON with results array, one entry per task.
     """
     if parent_agent is None:
-        return json.dumps({"error": "delegate_task requires a parent agent context."})
+        return tool_error("delegate_task requires a parent agent context.")
 
     # Depth limit
     depth = getattr(parent_agent, '_delegate_depth', 0)
@@ -487,43 +763,67 @@ def delegate_task(
     try:
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
-        return json.dumps({"error": str(exc)})
+        return tool_error(str(exc))
 
     # Normalize to task list
+    max_children = _get_max_concurrent_children()
     if tasks and isinstance(tasks, list):
-        task_list = tasks[:MAX_CONCURRENT_CHILDREN]
+        if len(tasks) > max_children:
+            return tool_error(
+                f"Too many tasks: {len(tasks)} provided, but "
+                f"max_concurrent_children is {max_children}. "
+                f"Either reduce the task count, split into multiple "
+                f"delegate_task calls, or increase "
+                f"delegation.max_concurrent_children in config.yaml."
+            )
+        task_list = [dict(task) for task in tasks]
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
+        task_list = [{
+            "goal": goal,
+            "context": context,
+            "toolsets": toolsets,
+            "execution_backend": execution_backend,
+        }]
     else:
-        return json.dumps({"error": "Provide either 'goal' (single task) or 'tasks' (batch)."})
+        return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
     if not task_list:
-        return json.dumps({"error": "No tasks provided."})
+        return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    default_backend = str(execution_backend or "default").strip() or "default"
+    if default_backend not in VALID_EXECUTION_BACKENDS:
+        return tool_error(
+            f"Unsupported execution_backend '{default_backend}'. Use one of: {', '.join(sorted(VALID_EXECUTION_BACKENDS))}."
+        )
+
+    # Validate each task has a goal and a supported backend.
     for i, task in enumerate(task_list):
         if not task.get("goal", "").strip():
-            return json.dumps({"error": f"Task {i} is missing a 'goal'."})
+            return tool_error(f"Task {i} is missing a 'goal'.")
+        try:
+            backend = _resolve_execution_backend(task, default_backend)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        task["execution_backend"] = backend
+        if backend == "codex_sdk_lane" and ((task.get("acp_command") or acp_command) or (task.get("acp_args") or acp_args)):
+            return tool_error("execution_backend='codex_sdk_lane' cannot be combined with ACP transport overrides.")
 
     overall_start = time.monotonic()
     results = []
 
     n_tasks = len(task_list)
-    # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
 
-    # Save parent tool names BEFORE any child construction mutates the global.
-    # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
-    # which overwrites model_tools._last_resolved_tool_names with child's toolset.
     import model_tools as _model_tools
     _parent_tool_names = list(_model_tools._last_resolved_tool_names)
 
-    # Build all child agents on the main thread (thread-safe construction)
-    # Wrapped in try/finally so the global is always restored even if a
-    # child build raises (otherwise _last_resolved_tool_names stays corrupted).
-    children = []
+    jobs = []
     try:
         for i, t in enumerate(task_list):
+            backend = t["execution_backend"]
+            if backend == "codex_sdk_lane":
+                jobs.append((i, t, backend, None))
+                continue
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets, model=creds["model"],
@@ -534,75 +834,111 @@ def delegate_task(
                 override_acp_command=t.get("acp_command") or acp_command,
                 override_acp_args=t.get("acp_args") or acp_args,
             )
-            # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
-            children.append((i, t, child))
+            jobs.append((i, t, backend, child))
     finally:
-        # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
-        # Single task -- run directly (no thread pool overhead)
-        _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        _i, _t, backend, child = jobs[0]
+        if backend == "codex_sdk_lane":
+            result = _run_codex_lane_child(task_index=0, task=_t, parent_agent=parent_agent)
+        else:
+            result = _run_single_child(0, _t["goal"], child, parent_agent)
         results.append(result)
     else:
-        # Batch -- run in parallel with per-task progress lines
         completed_count = 0
         spinner_ref = getattr(parent_agent, '_delegate_spinner', None)
 
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHILDREN) as executor:
+        with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
-            for i, t, child in children:
-                future = executor.submit(
-                    _run_single_child,
-                    task_index=i,
-                    goal=t["goal"],
-                    child=child,
-                    parent_agent=parent_agent,
-                )
+            for i, t, backend, child in jobs:
+                if backend == "codex_sdk_lane":
+                    future = executor.submit(
+                        _run_codex_lane_child,
+                        task_index=i,
+                        task=t,
+                        parent_agent=parent_agent,
+                    )
+                else:
+                    future = executor.submit(
+                        _run_single_child,
+                        task_index=i,
+                        goal=t["goal"],
+                        child=child,
+                        parent_agent=parent_agent,
+                    )
                 futures[future] = i
 
-            for future in as_completed(futures):
-                try:
-                    entry = future.result()
-                except Exception as exc:
-                    idx = futures[future]
-                    entry = {
-                        "task_index": idx,
-                        "status": "error",
-                        "summary": None,
-                        "error": str(exc),
-                        "api_calls": 0,
-                        "duration_seconds": 0,
-                    }
-                results.append(entry)
-                completed_count += 1
+            pending = set(futures.keys())
+            while pending:
+                if getattr(parent_agent, "_interrupt_requested", False) is True:
+                    for f in pending:
+                        idx = futures[f]
+                        if f.done():
+                            try:
+                                entry = f.result()
+                            except Exception as exc:
+                                entry = {
+                                    "task_index": idx,
+                                    "status": "error",
+                                    "summary": None,
+                                    "error": str(exc),
+                                    "api_calls": 0,
+                                    "duration_seconds": 0,
+                                }
+                        else:
+                            entry = {
+                                "task_index": idx,
+                                "status": "interrupted",
+                                "summary": None,
+                                "error": "Parent agent interrupted — child did not finish in time",
+                                "api_calls": 0,
+                                "duration_seconds": 0,
+                            }
+                        results.append(entry)
+                        completed_count += 1
+                    break
 
-                # Print per-task completion line above the spinner
-                idx = entry["task_index"]
-                label = task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
-                dur = entry.get("duration_seconds", 0)
-                status = entry.get("status", "?")
-                icon = "✓" if status == "completed" else "✗"
-                remaining = n_tasks - completed_count
-                completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
-                if spinner_ref:
+                from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
+                done, pending = _cf_wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done:
                     try:
-                        spinner_ref.print_above(completion_line)
-                    except Exception:
+                        entry = future.result()
+                    except Exception as exc:
+                        idx = futures[future]
+                        entry = {
+                            "task_index": idx,
+                            "status": "error",
+                            "summary": None,
+                            "error": str(exc),
+                            "api_calls": 0,
+                            "duration_seconds": 0,
+                        }
+                    results.append(entry)
+                    completed_count += 1
+
+                    idx = entry["task_index"]
+                    label = task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
+                    dur = entry.get("duration_seconds", 0)
+                    status = entry.get("status", "?")
+                    icon = "✓" if status == "completed" else "✗"
+                    remaining = n_tasks - completed_count
+                    completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
+                    if spinner_ref:
+                        try:
+                            spinner_ref.print_above(completion_line)
+                        except Exception:
+                            print(f"  {completion_line}")
+                    else:
                         print(f"  {completion_line}")
-                else:
-                    print(f"  {completion_line}")
 
-                # Update spinner text to show remaining count
-                if spinner_ref and remaining > 0:
-                    try:
-                        spinner_ref.update_text(f"🔀 {remaining} task{'s' if remaining != 1 else ''} remaining")
-                    except Exception as e:
-                        logger.debug("Spinner update_text failed: %s", e)
+                    if spinner_ref and remaining > 0:
+                        try:
+                            spinner_ref.update_text(f"🔀 {remaining} task{'s' if remaining != 1 else ''} remaining")
+                        except Exception as e:
+                            logger.debug("Spinner update_text failed: %s", e)
 
-        # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])
 
     # Notify parent's memory provider of delegation outcomes
@@ -610,10 +946,11 @@ def delegate_task(
         for entry in results:
             try:
                 _task_goal = task_list[entry["task_index"]]["goal"] if entry["task_index"] < len(task_list) else ""
+                child_ref = jobs[entry["task_index"]][3] if entry["task_index"] < len(jobs) else None
                 parent_agent._memory_manager.on_delegation(
                     task=_task_goal,
                     result=entry.get("summary", "") or "",
-                    child_session_id=getattr(children[entry["task_index"]][2], "session_id", "") if entry["task_index"] < len(children) else "",
+                    child_session_id=getattr(child_ref, "session_id", "") if child_ref is not None else "",
                 )
             except Exception:
                 pass
@@ -624,6 +961,38 @@ def delegate_task(
         "results": results,
         "total_duration_seconds": total_duration,
     }, ensure_ascii=False)
+
+
+def _resolve_child_credential_pool(effective_provider: Optional[str], parent_agent):
+    """Resolve a credential pool for the child agent.
+
+    Rules:
+    1. Same provider as the parent -> share the parent's pool so cooldown state
+       and rotation stay synchronized.
+    2. Different provider -> try to load that provider's own pool.
+    3. No pool available -> return None and let the child keep the inherited
+       fixed credential behavior.
+    """
+    if not effective_provider:
+        return getattr(parent_agent, "_credential_pool", None)
+
+    parent_provider = getattr(parent_agent, "provider", None) or ""
+    parent_pool = getattr(parent_agent, "_credential_pool", None)
+    if parent_pool is not None and effective_provider == parent_provider:
+        return parent_pool
+
+    try:
+        from agent.credential_pool import load_pool
+        pool = load_pool(effective_provider)
+        if pool is not None and pool.has_credentials():
+            return pool
+    except Exception as exc:
+        logger.debug(
+            "Could not load credential pool for child provider '%s': %s",
+            effective_provider,
+            exc,
+        )
+    return None
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -794,9 +1163,10 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Toolsets to enable for this subagent. "
                     "Default: inherits your enabled toolsets. "
+                    f"Available toolsets: {_TOOLSET_LIST_STR}. "
                     "Common patterns: ['terminal', 'file'] for code work, "
-                    "['web'] for research, ['terminal', 'file', 'web'] for "
-                    "full-stack tasks."
+                    "['web'] for research, ['browser'] for web interaction, "
+                    "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
             "tasks": {
@@ -809,7 +1179,7 @@ DELEGATE_TASK_SCHEMA = {
                         "toolsets": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Toolsets for this specific task. Use 'web' for network access, 'terminal' for shell.",
+                            "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
                         },
                         "acp_command": {
                             "type": "string",
@@ -820,12 +1190,19 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Per-task ACP args override.",
                         },
+                        "execution_backend": {
+                            "type": "string",
+                            "enum": ["default", "codex_sdk_lane"],
+                            "description": "Optional per-task execution backend override. Use 'codex_sdk_lane' to route this task through the bounded Hermes Codex SDK lane instead of spawning a child AIAgent.",
+                        },
                     },
                     "required": ["goal"],
                 },
-                "maxItems": 3,
+                # No maxItems — the runtime limit is configurable via
+                # delegation.max_concurrent_children (default 3) and
+                # enforced with a clear error in delegate_task().
                 "description": (
-                    "Batch mode: up to 3 tasks to run in parallel. Each gets "
+                    "Batch mode: tasks to run in parallel (limit configurable via delegation.max_concurrent_children, default 3). Each gets "
                     "its own subagent with isolated context and terminal session. "
                     "When provided, top-level goal/context/toolsets are ignored."
                 ),
@@ -854,6 +1231,14 @@ DELEGATE_TASK_SCHEMA = {
                     "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-6']"
                 ),
             },
+            "execution_backend": {
+                "type": "string",
+                "enum": ["default", "codex_sdk_lane"],
+                "description": (
+                    "Explicit delegation routing selector. Default 'default' preserves the current child AIAgent path. "
+                    "Set 'codex_sdk_lane' to execute the task through the Hermes-managed Codex SDK lane."
+                ),
+            },
         },
         "required": [],
     },
@@ -861,7 +1246,7 @@ DELEGATE_TASK_SCHEMA = {
 
 
 # --- Registry ---
-from tools.registry import registry
+from tools.registry import registry, tool_error
 
 registry.register(
     name="delegate_task",
@@ -875,6 +1260,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
+        execution_backend=args.get("execution_backend"),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",

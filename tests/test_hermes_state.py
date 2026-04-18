@@ -83,6 +83,26 @@ class TestSessionLifecycle:
         child = db.get_session("child")
         assert child["parent_session_id"] == "parent"
 
+    def test_update_codex_lane_refs_persists_in_model_config(self, db):
+        db.create_session(session_id="s1", source="cli", model_config={"max_iterations": 5})
+
+        assert db.update_codex_lane_refs(
+            "s1",
+            execution_backend="codex_sdk_lane",
+            lane_name="delegate-s1-1",
+            thread_id="thread-1",
+            last_run_id="run-1",
+            status="completed",
+            summary_path=".hermes/codex-lanes/delegate-s1-1/runs/run-1/summary.json",
+            final_path=".hermes/codex-lanes/delegate-s1-1/runs/run-1/final.txt",
+        )
+
+        model_config = db.get_session_model_config("s1")
+        assert model_config["max_iterations"] == 5
+        assert model_config["execution_backend"] == "codex_sdk_lane"
+        assert model_config["codex_lane_ref"]["lane_name"] == "delegate-s1-1"
+        assert model_config["codex_lane_ref"]["thread_id"] == "thread-1"
+
 
 # =========================================================================
 # Message storage
@@ -662,6 +682,84 @@ class TestPruneSessions:
         assert pruned == 1
         assert db.get_session("old_cli") is None
         assert db.get_session("old_tg") is not None
+
+    def test_prune_with_multilevel_chain(self, db):
+        """Pruning old sessions orphans newer children instead of crashing on FK."""
+        old_ts = time.time() - 200 * 86400
+        recent_ts = time.time() - 10 * 86400
+
+        # Chain: A (old) -> B (old) -> C (recent) -> D (recent)
+        db.create_session(session_id="A", source="cli")
+        db.end_session("A", end_reason="compressed")
+        db.create_session(session_id="B", source="cli", parent_session_id="A")
+        db.end_session("B", end_reason="compressed")
+        db.create_session(session_id="C", source="cli", parent_session_id="B")
+        db.end_session("C", end_reason="compressed")
+        db.create_session(session_id="D", source="cli", parent_session_id="C")
+        db.end_session("D", end_reason="done")
+
+        # Backdate A and B to be old; C and D stay recent
+        for sid, ts in [("A", old_ts), ("B", old_ts), ("C", recent_ts), ("D", recent_ts)]:
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?", (ts, sid)
+            )
+        db._conn.commit()
+
+        # Should not raise IntegrityError
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 2  # only A and B
+        assert db.get_session("A") is None
+        assert db.get_session("B") is None
+        # C and D survive, C is orphaned (parent_session_id NULL)
+        c = db.get_session("C")
+        assert c is not None
+        assert c["parent_session_id"] is None
+        d = db.get_session("D")
+        assert d is not None
+        assert d["parent_session_id"] == "C"
+
+    def test_prune_entire_old_chain(self, db):
+        """All sessions in a chain are old — entire chain is pruned."""
+        old_ts = time.time() - 200 * 86400
+
+        db.create_session(session_id="X", source="cli")
+        db.end_session("X", end_reason="compressed")
+        db.create_session(session_id="Y", source="cli", parent_session_id="X")
+        db.end_session("Y", end_reason="compressed")
+        db.create_session(session_id="Z", source="cli", parent_session_id="Y")
+        db.end_session("Z", end_reason="done")
+
+        for sid in ("X", "Y", "Z"):
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?", (old_ts, sid)
+            )
+        db._conn.commit()
+
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 3
+        for sid in ("X", "Y", "Z"):
+            assert db.get_session(sid) is None
+
+
+class TestDeleteSessionOrphansChildren:
+    def test_delete_orphans_children(self, db):
+        """Deleting a parent session orphans its children."""
+        db.create_session(session_id="parent", source="cli")
+        db.create_session(session_id="child", source="cli", parent_session_id="parent")
+        db.create_session(session_id="grandchild", source="cli", parent_session_id="child")
+
+        # Should not raise IntegrityError
+        result = db.delete_session("parent")
+        assert result is True
+        assert db.get_session("parent") is None
+        # Child is orphaned, not deleted
+        child = db.get_session("child")
+        assert child is not None
+        assert child["parent_session_id"] is None
+        # Grandchild is untouched
+        grandchild = db.get_session("grandchild")
+        assert grandchild is not None
+        assert grandchild["parent_session_id"] == "child"
 
 
 # =========================================================================

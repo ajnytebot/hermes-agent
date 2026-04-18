@@ -280,6 +280,9 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_AUTO_THREAD` | No | `true` | When `true`, automatically creates a new thread for every `@mention` in a text channel, so each conversation is isolated (similar to Slack behavior). Messages already inside threads or DMs are unaffected. |
 | `DISCORD_ALLOW_BOTS` | No | `"none"` | Controls how the bot handles messages from other Discord bots. `"none"` — ignore all other bots. `"mentions"` — only accept bot messages that `@mention` Hermes. `"all"` — accept all bot messages. |
 | `DISCORD_REACTIONS` | No | `true` | When `true`, the bot adds emoji reactions to messages during processing (👀 when starting, ✅ on success, ❌ on error). Set to `false` to disable reactions entirely. |
+| `DISCORD_IGNORED_CHANNELS` | No | — | Comma-separated channel IDs where the bot **never** responds, even when `@mentioned`. Takes priority over all other channel settings. |
+| `DISCORD_NO_THREAD_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds directly in the channel instead of creating a thread. Only relevant when `DISCORD_AUTO_THREAD` is `true`. |
+| `DISCORD_REPLY_TO_MODE` | No | `"first"` | Controls reply-reference behavior: `"off"` — never reply to the original message, `"first"` — reply-reference on the first message chunk only (default), `"all"` — reply-reference on every chunk. |
 
 ### Config File (`config.yaml`)
 
@@ -292,6 +295,9 @@ discord:
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
   reactions: true                 # Add emoji reactions during processing
+  ignored_channels: []            # Channel IDs where bot never responds
+  no_thread_channels: []          # Channel IDs where bot responds without threading
+  channel_prompts: {}             # Per-channel ephemeral system prompts
 
 # Session isolation (applies to all gateway platforms, not just Discord)
 group_sessions_per_user: true     # Isolate sessions per user in shared channels
@@ -342,6 +348,62 @@ Controls whether the bot adds emoji reactions to messages as visual feedback:
 
 Disable this if you find the reactions distracting or if the bot's role doesn't have the **Add Reactions** permission.
 
+#### `discord.ignored_channels`
+
+**Type:** string or list — **Default:** `[]`
+
+Channel IDs where the bot **never** responds, even when directly `@mentioned`. This takes the highest priority — if a channel is in this list, the bot silently ignores all messages there, regardless of `require_mention`, `free_response_channels`, or any other setting.
+
+```yaml
+# String format
+discord:
+  ignored_channels: "1234567890,9876543210"
+
+# List format
+discord:
+  ignored_channels:
+    - 1234567890
+    - 9876543210
+```
+
+If a thread's parent channel is in this list, messages in that thread are also ignored.
+
+#### `discord.no_thread_channels`
+
+**Type:** string or list — **Default:** `[]`
+
+Channel IDs where the bot responds directly in the channel instead of auto-creating a thread. This only has an effect when `auto_thread` is `true` (the default). In these channels, the bot responds inline like a normal message rather than spawning a new thread.
+
+```yaml
+discord:
+  no_thread_channels:
+    - 1234567890  # Bot responds inline here
+```
+
+Useful for channels dedicated to bot interaction where threads would add unnecessary noise.
+
+#### `discord.channel_prompts`
+
+**Type:** mapping — **Default:** `{}`
+
+Per-channel ephemeral system prompts that are injected on every turn in the matching Discord channel or thread without being persisted to transcript history.
+
+```yaml
+discord:
+  channel_prompts:
+    "1234567890": |
+      This channel is for research tasks. Prefer deep comparisons,
+      citations, and concise synthesis.
+    "9876543210": |
+      This forum is for therapy-style support. Be warm, grounded,
+      and non-judgmental.
+```
+
+Behavior:
+- Exact thread/channel ID matches win.
+- If a message arrives inside a thread or forum post and that thread has no explicit entry, Hermes falls back to the parent channel/forum ID.
+- Prompts are applied ephemerally at runtime, so changing them affects future turns immediately without rewriting past session history.
+
 #### `group_sessions_per_user`
 
 **Type:** boolean — **Default:** `true`
@@ -382,6 +444,26 @@ When enabled, makes the `/verbose` slash command available in the gateway, letti
 display:
   tool_progress_command: true
 ```
+
+## Interactive Model Picker
+
+Send `/model` with no arguments in a Discord channel to open a dropdown-based model picker:
+
+1. **Provider selection** — a Select dropdown showing available providers (up to 25).
+2. **Model selection** — a second dropdown with models for the chosen provider (up to 25).
+
+The picker times out after 120 seconds. Only authorized users (those in `DISCORD_ALLOWED_USERS`) can interact with it. If you know the model name, type `/model <name>` directly.
+
+## Native Slash Commands for Skills
+
+Hermes automatically registers installed skills as **native Discord Application Commands**. This means skills appear in Discord's autocomplete `/` menu alongside built-in commands.
+
+- Each skill becomes a Discord slash command (e.g., `/code-review`, `/ascii-art`)
+- Skills accept an optional `args` string parameter
+- Discord has a limit of 100 application commands per bot — if you have more skills than available slots, extra skills are skipped with a warning in the logs
+- Skills are registered during bot startup alongside built-in commands like `/model`, `/reset`, and `/background`
+
+No extra configuration is needed — any skill installed via `hermes skills install` is automatically registered as a Discord slash command on the next gateway restart.
 
 ## Home Channel
 

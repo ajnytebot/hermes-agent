@@ -20,9 +20,7 @@ Both ``code_execution_tool.py`` and ``tools/environments/local.py`` consult
 from __future__ import annotations
 
 import logging
-import os
 from contextvars import ContextVar
-from pathlib import Path
 from typing import Iterable
 
 logger = logging.getLogger(__name__)
@@ -66,18 +64,13 @@ def _load_config_passthrough() -> frozenset[str]:
 
     result: set[str] = set()
     try:
-        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-        config_path = hermes_home / "config.yaml"
-        if config_path.exists():
-            import yaml
-
-            with open(config_path) as f:
-                cfg = yaml.safe_load(f) or {}
-            passthrough = cfg.get("terminal", {}).get("env_passthrough")
-            if isinstance(passthrough, list):
-                for item in passthrough:
-                    if isinstance(item, str) and item.strip():
-                        result.add(item.strip())
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        passthrough = cfg.get("terminal", {}).get("env_passthrough")
+        if isinstance(passthrough, list):
+            for item in passthrough:
+                if isinstance(item, str) and item.strip():
+                    result.add(item.strip())
     except Exception as e:
         logger.debug("Could not read tools.env_passthrough from config: %s", e)
 
@@ -106,7 +99,3 @@ def clear_env_passthrough() -> None:
     _get_allowed().clear()
 
 
-def reset_config_cache() -> None:
-    """Force re-read of config on next access (for testing)."""
-    global _config_passthrough
-    _config_passthrough = None

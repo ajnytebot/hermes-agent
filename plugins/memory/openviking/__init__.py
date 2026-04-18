@@ -10,8 +10,9 @@ lifecycle instead of read-only search endpoints.
 Config via environment variables (profile-scoped via each profile's .env):
   OPENVIKING_ENDPOINT  — Server URL (default: http://127.0.0.1:1933)
   OPENVIKING_API_KEY   — API key (required for authenticated servers)
-  OPENVIKING_ACCOUNT   — Tenant account (default: root)
+  OPENVIKING_ACCOUNT   — Tenant account (default: default)
   OPENVIKING_USER      — Tenant user (default: default)
+  OPENVIKING_AGENT   — Tenant agent (default: hermes)
 
 Capabilities:
   - Automatic memory extraction on session commit (6 categories)
@@ -31,6 +32,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -79,11 +81,12 @@ class _VikingClient:
     """Thin HTTP client for the OpenViking REST API."""
 
     def __init__(self, endpoint: str, api_key: str = "",
-                 account: str = "", user: str = ""):
+                 account: str = "", user: str = "", agent: str = ""):
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
-        self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "root")
+        self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
         self._user = user or os.environ.get("OPENVIKING_USER", "default")
+        self._agent = agent or os.environ.get("OPENVIKING_AGENT", "hermes")
         self._httpx = _get_httpx()
         if self._httpx is None:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
@@ -93,6 +96,7 @@ class _VikingClient:
             "Content-Type": "application/json",
             "X-OpenViking-Account": self._account,
             "X-OpenViking-User": self._user,
+            "X-OpenViking-Agent": self._agent,
         }
         if self._api_key:
             h["X-API-Key"] = self._api_key
@@ -281,20 +285,44 @@ class OpenVikingMemoryProvider(MemoryProvider):
             },
             {
                 "key": "api_key",
-                "description": "OpenViking API key",
+                "description": "OpenViking API key (leave blank for local dev mode)",
                 "secret": True,
                 "env_var": "OPENVIKING_API_KEY",
+            },
+            {
+                "key": "account",
+                "description": "OpenViking tenant account ID ([default], used when local mode, OPENVIKING_API_KEY is empty)",
+                "default": "default",
+                "env_var": "OPENVIKING_ACCOUNT",
+            },
+            {
+                "key": "user",
+                "description": "OpenViking user ID within the account ([default], used when local mode, OPENVIKING_API_KEY is empty)",
+                "default": "default",
+                "env_var": "OPENVIKING_USER",
+            },
+            {
+                "key": "agent",
+                "description": "OpenViking agent ID within the account ([hermes], useful in multi-agent mode)",
+                "default": "hermes",
+                "env_var": "OPENVIKING_AGENT",
             },
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._endpoint = os.environ.get("OPENVIKING_ENDPOINT", _DEFAULT_ENDPOINT)
         self._api_key = os.environ.get("OPENVIKING_API_KEY", "")
+        self._account = os.environ.get("OPENVIKING_ACCOUNT", "default")
+        self._user = os.environ.get("OPENVIKING_USER", "default")
+        self._agent = os.environ.get("OPENVIKING_AGENT", "hermes")
         self._session_id = session_id
         self._turn_count = 0
 
         try:
-            self._client = _VikingClient(self._endpoint, self._api_key)
+            self._client = _VikingClient(
+                self._endpoint, self._api_key,
+                account=self._account, user=self._user, agent=self._agent,
+            )
             if not self._client.health():
                 logger.warning("OpenViking server at %s is not reachable", self._endpoint)
                 self._client = None
@@ -324,7 +352,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "(abstract/overview/full), viking_browse to explore.\n"
                 "Use viking_remember to store facts, viking_add_resource to index URLs/docs."
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("OpenViking system_prompt_block failed: %s", e)
             return (
                 "# OpenViking Knowledge Base\n"
                 f"Active. Endpoint: {self._endpoint}\n"
@@ -350,7 +379,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                client = _VikingClient(self._endpoint, self._api_key)
+                client = _VikingClient(
+                    self._endpoint, self._api_key,
+                    account=self._account, user=self._user, agent=self._agent,
+                )
                 resp = client.post("/api/v1/search/find", {
                     "query": query,
                     "top_k": 5,
@@ -385,7 +417,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         def _sync():
             try:
-                client = _VikingClient(self._endpoint, self._api_key)
+                client = _VikingClient(
+                    self._endpoint, self._api_key,
+                    account=self._account, user=self._user, agent=self._agent,
+                )
                 sid = self._session_id
 
                 # Add user message
@@ -441,7 +476,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         def _write():
             try:
-                client = _VikingClient(self._endpoint, self._api_key)
+                client = _VikingClient(
+                    self._endpoint, self._api_key,
+                    account=self._account, user=self._user, agent=self._agent,
+                )
                 # Add as a user message with memory context so the commit
                 # picks it up as an explicit memory during extraction
                 client.post(f"/api/v1/sessions/{self._session_id}/messages", {
@@ -461,7 +499,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if not self._client:
-            return json.dumps({"error": "OpenViking server not connected"})
+            return tool_error("OpenViking server not connected")
 
         try:
             if tool_name == "viking_search":
@@ -474,9 +512,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return self._tool_remember(args)
             elif tool_name == "viking_add_resource":
                 return self._tool_add_resource(args)
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+            return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return tool_error(str(e))
 
     def shutdown(self) -> None:
         # Wait for background threads to finish
@@ -493,7 +531,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def _tool_search(self, args: dict) -> str:
         query = args.get("query", "")
         if not query:
-            return json.dumps({"error": "query is required"})
+            return tool_error("query is required")
 
         payload: Dict[str, Any] = {"query": query}
         mode = args.get("mode", "auto")
@@ -508,19 +546,24 @@ class OpenVikingMemoryProvider(MemoryProvider):
         result = resp.get("result", {})
 
         # Format results for the model — keep it concise
-        formatted = []
+        scored_entries = []
         for ctx_type in ("memories", "resources", "skills"):
             items = result.get(ctx_type, [])
             for item in items:
+                raw_score = item.get("score")
+                sort_score = raw_score if raw_score is not None else 0.0
                 entry = {
                     "uri": item.get("uri", ""),
                     "type": ctx_type.rstrip("s"),
-                    "score": round(item.get("score", 0), 3),
+                    "score": round(raw_score, 3) if raw_score is not None else 0.0,
                     "abstract": item.get("abstract", ""),
                 }
                 if item.get("relations"):
                     entry["related"] = [r.get("uri") for r in item["relations"][:3]]
-                formatted.append(entry)
+                scored_entries.append((sort_score, entry))
+
+        scored_entries.sort(key=lambda x: x[0], reverse=True)
+        formatted = [entry for _, entry in scored_entries]
 
         return json.dumps({
             "results": formatted,
@@ -530,7 +573,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def _tool_read(self, args: dict) -> str:
         uri = args.get("uri", "")
         if not uri:
-            return json.dumps({"error": "uri is required"})
+            return tool_error("uri is required")
 
         level = args.get("level", "overview")
         # Map our level names to OpenViking GET endpoints
@@ -582,7 +625,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def _tool_remember(self, args: dict) -> str:
         content = args.get("content", "")
         if not content:
-            return json.dumps({"error": "content is required"})
+            return tool_error("content is required")
 
         # Store as a session message that will be extracted during commit.
         # The category hint helps OpenViking's extraction classify correctly.
@@ -606,7 +649,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def _tool_add_resource(self, args: dict) -> str:
         url = args.get("url", "")
         if not url:
-            return json.dumps({"error": "url is required"})
+            return tool_error("url is required")
 
         payload: Dict[str, Any] = {"path": url}
         if args.get("reason"):

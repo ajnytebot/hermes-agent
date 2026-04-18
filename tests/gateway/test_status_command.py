@@ -51,7 +51,8 @@ def _make_runner(session_entry: SessionEntry):
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = None
+    runner._session_db = MagicMock()
+    runner._session_db.get_session_title.return_value = None
     runner._reasoning_config = None
     runner._provider_routing = {}
     runner._fallback_model = None
@@ -82,10 +83,32 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
 
     result = await runner._handle_message(_make_event("/status"))
 
+    assert "**Session ID:** `sess-1`" in result
     assert "**Tokens:** 321" in result
     assert "**Agent Running:** Yes ⚡" in result
+    assert "**Title:**" not in result
     running_agent.interrupt.assert_not_called()
     assert runner._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_status_command_includes_session_title_when_present():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    runner._session_db.get_session_title.return_value = "My titled session"
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Session ID:** `sess-1`" in result
+    assert "**Title:** My titled session" in result
 
 
 @pytest.mark.asyncio
@@ -186,3 +209,28 @@ async def test_status_command_bypasses_active_session_guard():
     assert "Agent Running" in sent[0]
     assert not interrupt_event.is_set(), "/status incorrectly triggered an agent interrupt"
     assert session_key not in adapter._pending_messages, "/status was incorrectly queued"
+
+
+@pytest.mark.asyncio
+async def test_profile_command_reports_custom_root_profile(monkeypatch, tmp_path):
+    """Gateway /profile detects custom-root profiles (not under ~/.hermes)."""
+    from pathlib import Path
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    profile_home = tmp_path / "profiles" / "coder"
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "unrelated-home")
+
+    result = await runner._handle_profile_command(_make_event("/profile"))
+
+    assert "**Profile:** `coder`" in result
+    assert f"**Home:** `{profile_home}`" in result
