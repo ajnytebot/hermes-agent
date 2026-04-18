@@ -38,6 +38,7 @@ import threading
 from types import SimpleNamespace
 import uuid
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlsplit
 from openai import OpenAI
 import fire
 from datetime import datetime
@@ -671,6 +672,10 @@ class AIAgent:
         # would mangle the escape sequences.  None = use builtins.print.
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
+        self._codex_previous_response_id = None
+        self._codex_previous_response_history_len = 0
+        self._codex_previous_response_history_fingerprint = None
+        self._codex_previous_response_backend = None
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
@@ -2016,6 +2021,41 @@ class AIAgent:
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return "openrouter" in self._base_url_lower
+
+    def _supports_previous_response_id(self, base_url: str = None) -> bool:
+        """Return True when the active Responses backend supports previous_response_id threading."""
+        url = (base_url or self.base_url or "").lower()
+        if "models.github.ai" in url or "api.githubcopilot.com" in url:
+            return False
+        if "chatgpt.com/backend-api/codex" in url:
+            return False
+        return self._is_direct_openai_url(url) or is_local_endpoint(url)
+
+    def _previous_response_backend_key(self, base_url: str = None) -> Optional[str]:
+        """Return a stable backend identity for persisted previous_response_id state."""
+        raw_url = (base_url or self.base_url or "").strip()
+        if not raw_url:
+            return None
+        normalized_url = raw_url.lower()
+
+        if "chatgpt.com/backend-api/codex" in normalized_url:
+            return "chatgpt.com/backend-api/codex"
+        if "models.github.ai" in normalized_url:
+            return "models.github.ai"
+        if "api.githubcopilot.com" in normalized_url:
+            return "api.githubcopilot.com"
+        if self._is_direct_openai_url(normalized_url):
+            return "api.openai.com"
+        if is_local_endpoint(normalized_url):
+            parsed = urlsplit(raw_url)
+            scheme = (parsed.scheme or "http").lower()
+            hostname = (parsed.hostname or "").lower()
+            if not hostname:
+                return None
+            port = f":{parsed.port}" if parsed.port else ""
+            path = (parsed.path or "").rstrip("/")
+            return f"{scheme}://{hostname}{port}{path}"
+        return None
 
     @staticmethod
     def _model_requires_responses_api(model: str) -> bool:
@@ -3750,7 +3790,12 @@ class AIAgent:
         digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
         return f"fc_{digest}"
 
-    def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _chat_messages_to_responses_input(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        include_function_call_ids: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Convert internal chat-style messages to Responses input items."""
         items: List[Dict[str, Any]] = []
         seen_item_ids: set = set()
@@ -3832,12 +3877,22 @@ class AIAgent:
                                 arguments = str(arguments)
                             arguments = arguments.strip() or "{}"
 
-                            items.append({
+                            function_call_item = {
                                 "type": "function_call",
                                 "call_id": call_id,
                                 "name": fn_name,
                                 "arguments": arguments,
-                            })
+                            }
+                            if include_function_call_ids:
+                                response_item_id = tc.get("response_item_id")
+                                if not isinstance(response_item_id, str) or not response_item_id.strip():
+                                    response_item_id = embedded_response_item_id
+                                function_call_item["id"] = self._derive_responses_function_call_id(
+                                    call_id,
+                                    response_item_id,
+                                )
+
+                            items.append(function_call_item)
                     continue
 
                 items.append({"role": role, "content": content_text})
@@ -3858,6 +3913,147 @@ class AIAgent:
                 })
 
         return items
+
+    def _responses_history_fingerprint(self, messages: List[Dict[str, Any]]) -> str:
+        """Return a stable fingerprint for Responses-threading history matching."""
+        try:
+            payload = json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except TypeError:
+            payload = json.dumps(messages, ensure_ascii=False, default=str, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    def _history_messages_from_responses_payload(
+        self,
+        payload_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Strip ephemeral Responses-only prefixes (for example prefill messages)."""
+        prefill_count = len(self.prefill_messages or [])
+        if prefill_count <= 0:
+            return payload_messages
+        return payload_messages[prefill_count:]
+
+    @staticmethod
+    def _normalize_messages_for_responses_threading(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Match the durable history shape used just before _build_api_kwargs()."""
+        normalized: List[Dict[str, Any]] = []
+        strip_keys = {"reasoning", "finish_reason", "_flush_sentinel", "_thinking_prefill"}
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            normalized.append({k: v for k, v in msg.items() if k not in strip_keys})
+        return normalized
+
+    def _build_codex_responses_turn_input(
+        self,
+        payload_messages: List[Dict[str, Any]],
+    ) -> tuple[Optional[str], List[Dict[str, Any]]]:
+        """Return (previous_response_id, input_items) for the next Responses request.
+
+        Native threading is only used when the durable history still matches the
+        prefix that produced the stored previous_response_id. If the delta window
+        would start with tool outputs, widen it to include the immediately
+        preceding assistant tool-call message so function_call_output items are
+        never replayed without their matching function_call items.
+        """
+        history_messages = self._normalize_messages_for_responses_threading(
+            self._history_messages_from_responses_payload(payload_messages)
+        )
+        previous_response_id = getattr(self, "_codex_previous_response_id", None)
+        history_len = getattr(self, "_codex_previous_response_history_len", None)
+        history_fingerprint = getattr(self, "_codex_previous_response_history_fingerprint", None)
+        persisted_backend = getattr(self, "_codex_previous_response_backend", None)
+        current_backend = self._previous_response_backend_key()
+
+        can_thread = (
+            isinstance(previous_response_id, str)
+            and previous_response_id.strip()
+            and isinstance(history_len, int)
+            and history_len >= 0
+            and isinstance(history_fingerprint, str)
+            and isinstance(persisted_backend, str)
+            and persisted_backend == current_backend
+            and history_len <= len(history_messages)
+            and self._responses_history_fingerprint(history_messages[:history_len]) == history_fingerprint
+        )
+        if not can_thread:
+            return None, self._chat_messages_to_responses_input(payload_messages)
+
+        delta_start = history_len
+        if delta_start < len(history_messages):
+            first_delta = history_messages[delta_start]
+            if isinstance(first_delta, dict) and first_delta.get("role") == "tool":
+                back = delta_start - 1
+                while back >= 0:
+                    candidate = history_messages[back]
+                    if not isinstance(candidate, dict):
+                        break
+                    if candidate.get("role") == "assistant" and candidate.get("tool_calls"):
+                        delta_start = back
+                        break
+                    if candidate.get("role") in {"user", "system"}:
+                        break
+                    back -= 1
+
+        delta_messages = history_messages[delta_start:]
+        return previous_response_id.strip(), self._chat_messages_to_responses_input(
+            delta_messages,
+            include_function_call_ids=True,
+        )
+
+    def _persist_codex_previous_response_state(self) -> None:
+        """Write the current Responses continuity boundary to the session store."""
+        if not self._session_db or not self.session_id:
+            return
+        try:
+            self._session_db.update_codex_previous_response(
+                self.session_id,
+                getattr(self, "_codex_previous_response_id", None),
+                history_len=getattr(self, "_codex_previous_response_history_len", 0),
+                history_fingerprint=getattr(self, "_codex_previous_response_history_fingerprint", None),
+                backend=getattr(self, "_codex_previous_response_backend", None),
+            )
+        except Exception as e:
+            logger.debug("Session DB update_codex_previous_response failed: %s", e)
+
+    def _hydrate_codex_previous_response_state(self, session_row: Optional[Dict[str, Any]]) -> None:
+        """Restore persisted Responses continuity metadata from the session row."""
+        if self.api_mode != "codex_responses" or not isinstance(session_row, dict):
+            return
+
+        response_id = session_row.get("codex_previous_response_id")
+        history_len = session_row.get("codex_previous_response_history_len")
+        history_fingerprint = session_row.get("codex_previous_response_history_fingerprint")
+        backend = session_row.get("codex_previous_response_backend")
+
+        self._codex_previous_response_id = (
+            response_id.strip() if isinstance(response_id, str) and response_id.strip() else None
+        )
+        self._codex_previous_response_history_len = history_len if isinstance(history_len, int) and history_len >= 0 else 0
+        self._codex_previous_response_history_fingerprint = (
+            history_fingerprint if isinstance(history_fingerprint, str) and history_fingerprint else None
+        )
+        self._codex_previous_response_backend = (
+            backend.strip() if isinstance(backend, str) and backend.strip() else None
+        )
+
+    def _remember_codex_previous_response(self, response: Any, history_messages: List[Dict[str, Any]]) -> None:
+        """Persist the last successful Responses id plus its history boundary."""
+        response_id = getattr(response, "id", None)
+        if not isinstance(response_id, str) or not response_id.strip():
+            return
+
+        stored_history = history_messages
+        if stored_history and stored_history[0].get("role") == "system":
+            stored_history = stored_history[1:]
+        stored_history = self._normalize_messages_for_responses_threading(
+            self._history_messages_from_responses_payload(stored_history)
+        )
+
+        self._codex_previous_response_id = response_id.strip()
+        self._codex_previous_response_history_len = len(stored_history)
+        self._codex_previous_response_history_fingerprint = self._responses_history_fingerprint(stored_history)
+        self._codex_previous_response_backend = self._previous_response_backend_key()
+        self._persist_codex_previous_response_state()
 
     def _preflight_codex_input_items(self, raw_items: Any) -> List[Dict[str, Any]]:
         if not isinstance(raw_items, list):
@@ -4027,7 +4223,7 @@ class AIAgent:
             "model", "instructions", "input", "tools", "store",
             "reasoning", "include", "max_output_tokens", "temperature",
             "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-            "extra_headers",
+            "previous_response_id", "extra_headers",
         }
         normalized: Dict[str, Any] = {
             "model": model,
@@ -4056,6 +4252,36 @@ class AIAgent:
         temperature = api_kwargs.get("temperature")
         if isinstance(temperature, (int, float)):
             normalized["temperature"] = float(temperature)
+
+        previous_response_id = api_kwargs.get("previous_response_id")
+        if previous_response_id is not None:
+            if not isinstance(previous_response_id, str) or not previous_response_id.strip():
+                raise ValueError("Codex Responses request 'previous_response_id' must be a non-empty string when provided.")
+            paired_call_ids = {
+                item["call_id"]
+                for item in normalized_input
+                if item.get("type") == "function_call" and item.get("call_id")
+            }
+            missing_call_ids = sorted(
+                {
+                    item["call_id"]
+                    for item in normalized_input
+                    if item.get("type") == "function_call_output"
+                    and item.get("call_id")
+                    and item["call_id"] not in paired_call_ids
+                }
+            )
+            if missing_call_ids:
+                logger.error(
+                    "Malformed Codex replay window: previous_response_id=%s missing function_call pair(s) for call_id(s)=%s",
+                    previous_response_id,
+                    ", ".join(missing_call_ids),
+                )
+                raise ValueError(
+                    "Codex replay window is malformed: function_call_output items must include matching function_call items in the same request body. "
+                    f"Missing call_id(s): {', '.join(missing_call_ids)}"
+                )
+            normalized["previous_response_id"] = previous_response_id.strip()
 
         # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
         for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):
@@ -6510,15 +6736,22 @@ class AIAgent:
             _effort_clamp = {"minimal": "low"}
             reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
+            previous_response_id = None
+            input_items = self._chat_messages_to_responses_input(payload_messages)
+            if self._supports_previous_response_id():
+                previous_response_id, input_items = self._build_codex_responses_turn_input(payload_messages)
+
             kwargs = {
                 "model": self.model,
                 "instructions": instructions,
-                "input": self._chat_messages_to_responses_input(payload_messages),
+                "input": input_items,
                 "tools": self._responses_tools(),
                 "tool_choice": "auto",
                 "parallel_tool_calls": True,
                 "store": False,
             }
+            if previous_response_id:
+                kwargs["previous_response_id"] = previous_response_id
 
             if not is_github_responses:
                 kwargs["prompt_cache_key"] = self.session_id
@@ -8338,11 +8571,13 @@ class AIAgent:
         # prefix cache.
         if self._cached_system_prompt is None:
             stored_prompt = None
+            session_row = None
             if conversation_history and self._session_db:
                 try:
                     session_row = self._session_db.get_session(self.session_id)
                     if session_row:
                         stored_prompt = session_row.get("system_prompt") or None
+                        self._hydrate_codex_previous_response_state(session_row)
                 except Exception:
                     pass  # Fall through to build fresh
 
@@ -10442,6 +10677,8 @@ class AIAgent:
                         if not duplicate_interim:
                             messages.append(interim_msg)
                             self._emit_interim_assistant_message(interim_msg)
+                            if self.api_mode == "codex_responses":
+                                self._remember_codex_previous_response(response, messages)
 
                     if self._codex_incomplete_retries < 3:
                         if not self.quiet_mode:
@@ -10509,6 +10746,8 @@ class AIAgent:
 
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         messages.append(assistant_msg)
+                        if self.api_mode == "codex_responses":
+                            self._remember_codex_previous_response(response, messages)
                         for tc in assistant_message.tool_calls:
                             if tc.function.name not in self.valid_tool_names:
                                 content = f"Tool '{tc.function.name}' does not exist. Available tools: {available}"
@@ -10592,6 +10831,8 @@ class AIAgent:
                             # Append the assistant message with its (broken) tool_calls
                             recovery_assistant = self._build_assistant_message(assistant_message, finish_reason)
                             messages.append(recovery_assistant)
+                            if self.api_mode == "codex_responses":
+                                self._remember_codex_previous_response(response, messages)
                             
                             # Respond with tool error results for each tool call
                             invalid_names = {name for name, _ in invalid_json_args}
@@ -10680,6 +10921,8 @@ class AIAgent:
 
                     messages.append(assistant_msg)
                     self._emit_interim_assistant_message(assistant_msg)
+                    if self.api_mode == "codex_responses":
+                        self._remember_codex_previous_response(response, messages)
 
                     # Close any open streaming display (response box, reasoning
                     # box) before tool execution begins.  Intermediate turns may
@@ -10900,6 +11143,8 @@ class AIAgent:
                             )
                             interim_msg["_thinking_prefill"] = True
                             messages.append(interim_msg)
+                            if self.api_mode == "codex_responses":
+                                self._remember_codex_previous_response(response, messages)
                             self._session_messages = messages
                             self._save_session_log(messages)
                             continue
@@ -10971,6 +11216,8 @@ class AIAgent:
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         assistant_msg["content"] = "(empty)"
                         messages.append(assistant_msg)
+                        if self.api_mode == "codex_responses":
+                            self._remember_codex_previous_response(response, messages)
 
                         if reasoning_text:
                             reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
@@ -11018,6 +11265,7 @@ class AIAgent:
                         interim_msg = self._build_assistant_message(assistant_message, "incomplete")
                         messages.append(interim_msg)
                         self._emit_interim_assistant_message(interim_msg)
+                        self._remember_codex_previous_response(response, messages)
 
                         continue_msg = {
                             "role": "user",
@@ -11055,6 +11303,8 @@ class AIAgent:
                         messages.pop()
 
                     messages.append(final_msg)
+                    if self.api_mode == "codex_responses":
+                        self._remember_codex_previous_response(response, messages)
                     
                     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                     if not self.quiet_mode:

@@ -17,6 +17,7 @@ sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
 sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
@@ -418,6 +419,385 @@ class TestBuildApiKwargsCodex:
 
 
 # ── Message conversion tests ────────────────────────────────────────────────
+
+class TestCodexPreviousResponseIdThreading:
+    def _make_codex_agent(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "openai-codex",
+            api_mode="codex_responses",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        monkeypatch.setattr(agent, "_build_system_prompt", lambda *a, **k: "system prompt")
+        monkeypatch.setattr(agent, "_save_session_log", lambda *a, **k: None)
+        monkeypatch.setattr(agent, "_persist_session", lambda *a, **k: None)
+        agent.model = "codex-mini-latest"
+        agent.client = MagicMock()
+        return agent
+
+    @staticmethod
+    def _codex_response(response_id, text):
+        return SimpleNamespace(
+            id=response_id,
+            model="codex-mini-latest",
+            status="completed",
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    phase="final_answer",
+                    content=[SimpleNamespace(type="output_text", text=text)],
+                )
+            ],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+
+    def test_first_turn_does_not_send_previous_response_id(self, monkeypatch):
+        agent = self._make_codex_agent(monkeypatch)
+        kwargs_seen = []
+
+        def fake_api(kwargs):
+            kwargs_seen.append(kwargs)
+            return self._codex_response("resp_1", "First reply")
+
+        monkeypatch.setattr(agent, "_interruptible_api_call", fake_api)
+
+        result = agent.run_conversation("hello", conversation_history=[])
+
+        assert result["final_response"] == "First reply"
+        assert len(kwargs_seen) == 1
+        assert "previous_response_id" not in kwargs_seen[0]
+        assert kwargs_seen[0]["input"] == [{"role": "user", "content": "hello"}]
+
+    def test_follow_up_turn_omits_previous_response_id_for_chatgpt_codex_backend(self, monkeypatch):
+        agent = self._make_codex_agent(monkeypatch)
+        kwargs_seen = []
+        responses = iter(
+            [
+                self._codex_response("resp_1", "First reply"),
+                self._codex_response("resp_2", "Second reply"),
+            ]
+        )
+
+        def fake_api(kwargs):
+            kwargs_seen.append(kwargs)
+            return next(responses)
+
+        monkeypatch.setattr(agent, "_interruptible_api_call", fake_api)
+
+        first = agent.run_conversation("hello", conversation_history=[])
+        second = agent.run_conversation("follow up", conversation_history=first["messages"])
+
+        assert first["final_response"] == "First reply"
+        assert second["final_response"] == "Second reply"
+        assert len(kwargs_seen) == 2
+        assert "previous_response_id" not in kwargs_seen[0]
+        assert "previous_response_id" not in kwargs_seen[1]
+        assert kwargs_seen[1]["input"] == agent._chat_messages_to_responses_input(
+            first["messages"] + [{"role": "user", "content": "follow up"}]
+        )
+
+    def test_falls_back_to_full_replay_when_no_previous_response_id_is_stored(self, monkeypatch):
+        agent = self._make_codex_agent(monkeypatch)
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "First reply", "finish_reason": "stop"},
+            {"role": "user", "content": "follow up"},
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert "previous_response_id" not in kwargs
+        assert kwargs["input"] == agent._chat_messages_to_responses_input(messages)
+
+    def test_delta_starting_with_tool_output_replays_matching_function_call(self, monkeypatch):
+        agent = self._make_codex_agent(monkeypatch)
+        monkeypatch.setattr(agent, "_supports_previous_response_id", lambda base_url=None: True)
+        monkeypatch.setattr(agent, "_previous_response_backend_key", lambda base_url=None: "replay-test-backend")
+        tool_call_message = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_abc|fc_abc",
+                    "call_id": "call_abc",
+                    "response_item_id": "fc_abc",
+                    "function": {
+                        "name": "calculator",
+                        "arguments": '{"expression":"6*7"}',
+                    },
+                }
+            ],
+        }
+        payload_messages = [
+            {"role": "user", "content": "What is 6*7?"},
+            tool_call_message,
+            {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
+            {"role": "assistant", "content": "The result is 42.", "finish_reason": "stop"},
+            {"role": "user", "content": "Thanks"},
+        ]
+        prefix = payload_messages[:2]
+        agent._codex_previous_response_id = "resp_1"
+        agent._codex_previous_response_history_len = len(prefix)
+        agent._codex_previous_response_history_fingerprint = agent._responses_history_fingerprint(prefix)
+        agent._codex_previous_response_backend = agent._previous_response_backend_key()
+
+        kwargs = agent._build_api_kwargs(payload_messages)
+
+        assert kwargs["previous_response_id"] == "resp_1"
+        assert [item["type"] for item in kwargs["input"][:2]] == ["function_call", "function_call_output"]
+        assert kwargs["input"][0]["call_id"] == "call_abc"
+        assert kwargs["input"][0]["id"] == "fc_abc"
+        assert kwargs["input"][1]["call_id"] == "call_abc"
+        assert kwargs["input"][-1] == {"role": "user", "content": "Thanks"}
+
+    def test_malformed_replay_window_is_rejected(self, monkeypatch):
+        agent = self._make_codex_agent(monkeypatch)
+
+        with pytest.raises(ValueError, match="Codex replay window is malformed"):
+            agent._preflight_codex_api_kwargs(
+                {
+                    "model": "codex-mini-latest",
+                    "instructions": "system prompt",
+                    "previous_response_id": "resp_1",
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_orphan",
+                            "output": "42",
+                        }
+                    ],
+                }
+            )
+
+    def test_resumed_agent_restores_persisted_previous_response_id(self, monkeypatch, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "resume-codex"
+        db.create_session(session_id=session_id, source="cli", model="codex-mini-latest")
+
+        first_agent = AIAgent(
+            api_key="test-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider="openai-codex",
+            api_mode="codex_responses",
+            max_iterations=4,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_id=session_id,
+            session_db=db,
+            persist_session=True,
+        )
+        monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: _tool_defs("web_search", "terminal"))
+        monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
+        monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
+        monkeypatch.setattr(first_agent, "_build_system_prompt", lambda *a, **k: "system prompt")
+        monkeypatch.setattr(first_agent, "_save_session_log", lambda *a, **k: None)
+        first_agent.model = "codex-mini-latest"
+        first_seen = []
+
+        def first_fake_api(kwargs):
+            first_seen.append(kwargs)
+            return self._codex_response("resp_1", "First reply")
+
+        monkeypatch.setattr(first_agent, "_interruptible_api_call", first_fake_api)
+        first = first_agent.run_conversation("hello", conversation_history=[])
+
+        session = db.get_session(session_id)
+        assert session["codex_previous_response_id"] == "resp_1"
+        assert session["codex_previous_response_history_len"] == 2
+        assert isinstance(session["codex_previous_response_history_fingerprint"], str)
+        assert session["codex_previous_response_backend"] == "chatgpt.com/backend-api/codex"
+        assert "previous_response_id" not in first_seen[0]
+
+        resumed_agent = AIAgent(
+            api_key="test-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider="openai-codex",
+            api_mode="codex_responses",
+            max_iterations=4,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_id=session_id,
+            session_db=db,
+            persist_session=True,
+        )
+        monkeypatch.setattr(resumed_agent, "_build_system_prompt", lambda *a, **k: "system prompt")
+        monkeypatch.setattr(resumed_agent, "_save_session_log", lambda *a, **k: None)
+        resumed_agent.model = "codex-mini-latest"
+        resumed_seen = []
+
+        def resumed_fake_api(kwargs):
+            resumed_seen.append(kwargs)
+            return self._codex_response("resp_2", "Second reply")
+
+        monkeypatch.setattr(resumed_agent, "_interruptible_api_call", resumed_fake_api)
+        second = resumed_agent.run_conversation("follow up", conversation_history=first["messages"])
+
+        assert second["final_response"] == "Second reply"
+        assert "previous_response_id" not in resumed_seen[0]
+        assert resumed_seen[0]["input"] == resumed_agent._chat_messages_to_responses_input(
+            first["messages"] + [{"role": "user", "content": "follow up"}]
+        )
+        db.close()
+
+
+class TestLocalResponsesPreviousResponseIdThreading:
+    def _make_local_responses_agent(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            api_mode="codex_responses",
+            base_url="http://localhost:1234/v1",
+        )
+        monkeypatch.setattr(agent, "_build_system_prompt", lambda *a, **k: "system prompt")
+        monkeypatch.setattr(agent, "_save_session_log", lambda *a, **k: None)
+        monkeypatch.setattr(agent, "_persist_session", lambda *a, **k: None)
+        agent.model = "gpt-5"
+        agent.client = MagicMock()
+        return agent
+
+    def _make_persisted_responses_agent(self, monkeypatch, db, session_id, *, base_url):
+        provider = "openai-codex" if "api.openai.com" in base_url else "custom"
+        agent = AIAgent(
+            api_key="test-key",
+            base_url=base_url,
+            provider=provider,
+            api_mode="codex_responses",
+            max_iterations=4,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_id=session_id,
+            session_db=db,
+            persist_session=True,
+        )
+        monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: _tool_defs("web_search", "terminal"))
+        monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
+        monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
+        monkeypatch.setattr(agent, "_build_system_prompt", lambda *a, **k: "system prompt")
+        monkeypatch.setattr(agent, "_save_session_log", lambda *a, **k: None)
+        agent.model = "gpt-5"
+        return agent
+
+    @staticmethod
+    def _responses_response(response_id, text):
+        return SimpleNamespace(
+            id=response_id,
+            model="gpt-5",
+            status="completed",
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    phase="final_answer",
+                    content=[SimpleNamespace(type="output_text", text=text)],
+                )
+            ],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+
+    def test_follow_up_turn_threads_previous_response_id_for_local_responses_backend(self, monkeypatch):
+        agent = self._make_local_responses_agent(monkeypatch)
+        kwargs_seen = []
+        responses = iter(
+            [
+                self._responses_response("resp_local_1", "First reply"),
+                self._responses_response("resp_local_2", "Second reply"),
+            ]
+        )
+
+        def fake_api(kwargs):
+            kwargs_seen.append(kwargs)
+            return next(responses)
+
+        monkeypatch.setattr(agent, "_interruptible_api_call", fake_api)
+
+        first = agent.run_conversation("hello", conversation_history=[])
+        second = agent.run_conversation("follow up", conversation_history=first["messages"])
+
+        assert first["final_response"] == "First reply"
+        assert second["final_response"] == "Second reply"
+        assert len(kwargs_seen) == 2
+        assert "previous_response_id" not in kwargs_seen[0]
+        assert kwargs_seen[1]["previous_response_id"] == "resp_local_1"
+        assert kwargs_seen[1]["input"] == [{"role": "user", "content": "follow up"}]
+
+    def test_resumed_session_does_not_reuse_previous_response_id_across_supported_backends(self, monkeypatch, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "resume-cross-backend"
+        db.create_session(session_id=session_id, source="cli", model="gpt-5")
+
+        first_agent = self._make_persisted_responses_agent(
+            monkeypatch, db, session_id, base_url="http://localhost:1234/v1"
+        )
+        first_seen = []
+
+        def first_fake_api(kwargs):
+            first_seen.append(kwargs)
+            return self._responses_response("resp_local_1", "First reply")
+
+        monkeypatch.setattr(first_agent, "_interruptible_api_call", first_fake_api)
+        first = first_agent.run_conversation("hello", conversation_history=[])
+
+        session = db.get_session(session_id)
+        assert session["codex_previous_response_id"] == "resp_local_1"
+        assert session["codex_previous_response_backend"] == "http://localhost:1234/v1"
+        assert "previous_response_id" not in first_seen[0]
+
+        resumed_agent = self._make_persisted_responses_agent(
+            monkeypatch, db, session_id, base_url="https://api.openai.com/v1"
+        )
+        resumed_seen = []
+
+        def resumed_fake_api(kwargs):
+            resumed_seen.append(kwargs)
+            return self._responses_response("resp_openai_2", "Second reply")
+
+        monkeypatch.setattr(resumed_agent, "_interruptible_api_call", resumed_fake_api)
+        second = resumed_agent.run_conversation("follow up", conversation_history=first["messages"])
+
+        assert second["final_response"] == "Second reply"
+        assert "previous_response_id" not in resumed_seen[0]
+        assert resumed_seen[0]["input"] == resumed_agent._chat_messages_to_responses_input(
+            first["messages"] + [{"role": "user", "content": "follow up"}]
+        )
+        db.close()
+
+    def test_resumed_session_reuses_previous_response_id_on_same_supported_backend(self, monkeypatch, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "resume-same-backend"
+        db.create_session(session_id=session_id, source="cli", model="gpt-5")
+
+        first_agent = self._make_persisted_responses_agent(
+            monkeypatch, db, session_id, base_url="http://localhost:1234/v1"
+        )
+        monkeypatch.setattr(
+            first_agent,
+            "_interruptible_api_call",
+            lambda kwargs: self._responses_response("resp_local_1", "First reply"),
+        )
+        first = first_agent.run_conversation("hello", conversation_history=[])
+
+        resumed_agent = self._make_persisted_responses_agent(
+            monkeypatch, db, session_id, base_url="http://localhost:1234/v1"
+        )
+        resumed_seen = []
+
+        def resumed_fake_api(kwargs):
+            resumed_seen.append(kwargs)
+            return self._responses_response("resp_local_2", "Second reply")
+
+        monkeypatch.setattr(resumed_agent, "_interruptible_api_call", resumed_fake_api)
+        second = resumed_agent.run_conversation("follow up", conversation_history=first["messages"])
+
+        assert second["final_response"] == "Second reply"
+        assert resumed_seen[0]["previous_response_id"] == "resp_local_1"
+        assert resumed_seen[0]["input"] == [{"role": "user", "content": "follow up"}]
+        db.close()
 
 class TestChatMessagesToResponsesInput:
     """Verify _chat_messages_to_responses_input for Codex mode."""
